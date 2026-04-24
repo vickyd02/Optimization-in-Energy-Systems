@@ -1,0 +1,114 @@
+#The code for the dry year
+
+using JuMP
+using Clp
+using XLSX
+using Printf
+
+data = XLSX.readxlsx("/Users/vicky/Downloads/Energy 291 Optimization/HW_3_3_data_A.xlsx")
+sheet = data["Inputs"]
+
+# Read DRY YEAR Inflows
+raw_inflows_dry = vec(sheet["D6:D57"])
+Q_inflow = Float64.(raw_inflows_dry) .* 1e6  
+
+# Read Power Prices 
+raw_prices = vec(sheet["B67:B118"])
+lambda_price = Float64.(raw_prices)
+
+# ==============================================================================
+# 2. PARAMETERS
+# ==============================================================================
+T = 52                     
+eta_t = 0.925              
+eta_p = 0.85               
+g = 9.81                   
+delta_h = 25.0             
+rho = 1000.0               
+P_max = 1.0                
+V_min = 1.1e8              
+V_max = 1.2e8              
+C_fix = 2000.0             
+T_s = 168.0 * 3600.0       
+T_hours = 168.0            
+V_initial = 1.1e8          
+Min_Outflow = 95000.0      # Ecological minimum (m^3)
+
+# ==============================================================================
+# 3. BUILD DRY MODEL
+# ==============================================================================
+model_dry = Model(Clp.Optimizer)
+set_silent(model_dry)
+
+@variable(model_dry, 0 <= pt_g[1:T] <= P_max)
+@variable(model_dry, 0 <= pt_p[1:T] <= P_max)
+@variable(model_dry, mt_g[1:T] >= 0)
+@variable(model_dry, mt_p[1:T] >= 0)
+@variable(model_dry, V_min <= vt[1:T] <= V_max)
+
+@objective(model_dry, Max, sum((lambda_price[t] * pt_g[t] * T_hours) - (lambda_price[t] * pt_p[t] * T_hours) - C_fix for t in 1:T))
+
+# Physics Constraints
+@constraint(model_dry, Gen_Physics[t=1:T], pt_g[t] == eta_t * mt_g[t] * g * delta_h * 1e-6)
+@constraint(model_dry, Pump_Physics[t=1:T], pt_p[t] == (mt_p[t] * g * delta_h / eta_p) * 1e-6)
+
+# Continuity Constraints (Standard)
+@constraint(model_dry, Cont_W1, vt[1] <= V_initial + Q_inflow[1] - (mt_g[1] / rho) * T_s + (mt_p[1] / rho) * T_s)
+@constraint(model_dry, Cont_Rest[t=2:T], vt[t] <= vt[t-1] + Q_inflow[t] - (mt_g[t] / rho) * T_s + (mt_p[t] / rho) * T_s)
+
+# Ecological Constraint
+@constraint(model_dry, Eco_Flow[t=1:T], (mt_g[t] / rho) * T_s >= Min_Outflow)
+
+optimize!(model_dry)
+@printf("Dry Year Optimal Profit: \$%.2f\n", objective_value(model_dry))
+
+# ==============================================================================
+# Rainy Year
+# ==============================================================================
+raw_inflows_rainy = vec(sheet["C6:C57"])
+Q_inflow_rainy = Float64.(raw_inflows_rainy) .* 1e6  
+
+# ==============================================================================
+# 2. BUILD RAINY MODEL (WITH SPILLAGE) (INCLUDED TO ACCOUNT FOR INFEASIBILITY COND)
+# ==============================================================================
+model_rainy = Model(Clp.Optimizer)
+set_silent(model_rainy)
+
+@variable(model_rainy, 0 <= pt_g[1:T] <= P_max)
+@variable(model_rainy, 0 <= pt_p[1:T] <= P_max)
+@variable(model_rainy, mt_g[1:T] >= 0)
+@variable(model_rainy, mt_p[1:T] >= 0)
+@variable(model_rainy, V_min <= vt[1:T] <= V_max)
+
+# --- THE FIX: NEW SPILLAGE VARIABLE ---
+@variable(model_rainy, spill[1:T] >= 0)  # Volume of water bypassed (m^3)
+
+@objective(model_rainy, Max, sum((lambda_price[t] * pt_g[t] * T_hours) - (lambda_price[t] * pt_p[t] * T_hours) - C_fix for t in 1:T))
+
+# Physics Constraints
+@constraint(model_rainy, Gen_Physics[t=1:T], pt_g[t] == eta_t * mt_g[t] * g * delta_h * 1e-6)
+@constraint(model_rainy, Pump_Physics[t=1:T], pt_p[t] == (mt_p[t] * g * delta_h / eta_p) * 1e-6)
+
+# --- THE FIX: UPDATED CONTINUITY WITH EXACT EQUALITY (==) AND SPILLAGE ---
+@constraint(model_rainy, Cont_W1, vt[1] == V_initial + Q_inflow_rainy[1] - (mt_g[1] / rho) * T_s + (mt_p[1] / rho) * T_s - spill[1])
+@constraint(model_rainy, Cont_Rest[t=2:T], vt[t] == vt[t-1] + Q_inflow_rainy[t] - (mt_g[t] / rho) * T_s + (mt_p[t] / rho) * T_s - spill[t])
+
+# --- THE FIX: ECOLOGICAL CONSTRAINT COUNTS BOTH TURBINE AND SPILLWAY ---
+@constraint(model_rainy, Eco_Flow[t=1:T], ((mt_g[t] / rho) * T_s) + spill[t] >= Min_Outflow)
+
+optimize!(model_rainy)
+
+println("Solver Status: ", termination_status(model_rainy))
+@printf("Rainy Year Optimal Profit: \$%.2f\n\n", objective_value(model_rainy))
+
+println("Week | Price (\$/MWh) | Gen Released (m³) | Spilled (m³) | Total Outflow (m³)")
+println("-"^75)
+for t in 1:T
+    price_val = lambda_price[t]
+    gen_released = (value(mt_g[t]) / rho) * T_s
+    spilled_vol = value(spill[t])
+    total_outflow = gen_released + spilled_vol
+    
+    @printf("%4d | %13.2f | %17.0f | %12.0f | %18.0f\n", 
+            t, price_val, gen_released, spilled_vol, total_outflow)
+end
